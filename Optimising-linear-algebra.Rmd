@@ -1,0 +1,126 @@
+---
+title: 'Optimising linear algebra'
+date: "5 August 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+```
+
+Linear algebra is fundamental for data science. Standard CPUs aren't very good at it: they can spend nearly all the time getting data on and off the CPU and very little time doing productive calculations. Specially designed chips for matrix operations (GPUs) and higher-dimensional tensor operations (TPUs) are the future way around this problem, but optimising data flow is important even there.
+
+The basic idea is to partition a matrix into blocks, chosen to match features of the computer such as cache size. It's hard to derive the optimal block size from first principles, so optimisation is done by measuring many problems of different sizes and trying to fit a model of some sort to find the best settings.
+
+The data (`sgemm_product.csv`) is the result of an exhaustive experiment (`Readme.txt`) in optimising matrix-matrix multiplication for a particular GPU. There are 14 predictor variables in 261400 possible combinations. For each combination there are timings for four runs of multiplying two $2048\times 2048$ matrices. Typically we would not have such exhaustive data, so we want to know how good the prediction from a subsample will be.
+
+You will model `log(time)`, not `time`, because that's what the experiment was designed for. The effects of the variables should be closer to multiplicative than additive.
+
+## Tasks
+
+1. Read in the data and choose your own random sample of 500 rows with
+
+```
+set.seed(your_id_number)
+my_sample<-sample(241600, 500)
+```
+```{r}
+sgemm1 <- read_csv("sgemm_product.csv")
+set.seed(700922956)
+my_sample<-sample(241600, 500)
+data <- sgemm1[my_sample,]
+```
+2. Using the `leaps` package, as in class, run backwards stepwise selection to predict timings from the **logarithm of time** for first run on models with all 14 predictors and all two-way interactions. Look at models with up to 20 variables. Plot the apparent error against the number of predictors. 
+```{r}
+data_l <- data[, -c(16:18)] %>% mutate("log_time" = log(`Run1 (ms)`)) %>% select(-15)
+
+# Generate design matrix and response
+mf <- model.frame(log_time~.^2, data = data_l)
+X <- model.matrix(log_time~.^2, mf)[, -1]
+y <- data_l$log_time
+
+library(leaps) # leaps package does stepwise selection
+# fit all the best models of various sizes up to 20
+search <- regsubsets(X,data_l$log_time, method="back",nvmax=20)
+summ<-summary(search)
+
+# calculate AIC
+aic<-500*log(summ$rss)+2*(1:20)
+
+apparentErrors = summ$rss / (nrow(data_l) - 1:20)
+
+plot(1:20, apparentErrors,type="b",pch=19,col="blue", xlab="Number of predictors",ylab="Prediction error")
+
+legend("bottomleft",pch=c(1,19),col="blue", legend=,"Apparent error",bty="n")
+
+abline(v=which.min(aic))
+
+```
+
+3. Using cross-validation, select a tuning parameter $\lambda$ so that minimising $n\log\mathrm{RSS}+\lambda p$ gives good mean squared prediction error, and select a predictive model.  
+```{r}
+# crossvalidation
+
+allyhat<-function(xtrain, ytrain, xtest,lambdas,nvmax=20){
+  n<-nrow(xtrain)
+  yhat<-matrix(nrow=nrow(xtest),ncol=length(lambdas))
+  search<-regsubsets(xtrain,ytrain, nvmax=nvmax, method="back")
+  summ<-summary(search)
+  for(i in 1:length(lambdas)){
+    penMSE<- n*log(summ$rss)+lambdas[i]*(1:nvmax)
+    best<-which.min(penMSE)  #lowest penMSE
+    betahat<-coef(search, best) #coefficients
+    xinmodel<-cbind(1,xtest)[,summ$which[best,]] #predictors in that model
+    yhat[,i]<-xinmodel%*%betahat
+  }
+  yhat
+}
+
+n<-nrow(X)
+folds<-sample(rep(1:10,length=n))
+lambdas<-c(2,4,6,8,10,12)
+fitted<-matrix(nrow=n,ncol=length(lambdas))
+for(k in 1:10){
+  train<- (1:n)[folds!=k]
+  test<-(1:n)[folds==k]
+  fitted[test,]<-allyhat(X[train,],y[train],X[test,],lambdas, nvmax = 20)  
+}
+rbind(lambdas, colMeans((y-fitted)^2))
+```
+When lambda is 8, the Penalised RSS is the smallest. Hence, $\lambda$ = 8 is probably the best model.
+
+```{r}
+#Fit to full data set and choose best model using penalty λ = 8
+search<-regsubsets(X,y, nvmax=20, method="back")
+summ<-summary(search)
+penalalisedRSS <- 500*log(summ$rss)+8*(1:20) # aic
+best<-which.min(penalalisedRSS) #lowest penalalised RSS
+betahat<-coef(search, best) #coefficients for the best model
+betahat
+```
+
+4. Estimate the actual mean squared prediction error of your model using the second replicate of the experiment (`log(Run2)`) in your sample data set.
+```{r}
+data_2 <- data[, -c(15, 17, 18)] %>% mutate("log_time2" = log(`Run2 (ms)`)) %>% select(-15)
+
+xinmodel<-cbind(1,X)[,summ$which[best,]] #predictors in that model
+yhat<-xinmodel%*%betahat
+mspe <- mean((data_2$log_time2 - yhat)^2)
+mspe
+```
+5. Estimate the actual mean squared prediction error of your model using the second replicate of the experiment (`log(Run2)`) on all 261400 observations. How does this value compare to the estimate you found in question 4?
+```{r cache=TRUE}
+whole_l <- sgemm1[, -c(15, 17, 18)] %>% mutate("log_time2" = log(`Run2 (ms)`)) %>% select(-15)
+mf_w <- model.frame(log_time2~.^2, data = whole_l)
+X_w <- model.matrix(log_time2~.^2, mf_w)[, -1]
+y_w <- whole_l$log_time2
+```
+
+```{r cache=TRUE}
+xinmodel<-cbind(1,X_w)[,summ$which[best,]] #predictors in that model
+yhat_w<-xinmodel%*%betahat
+mspe <- mean((whole_l$log_time2 - yhat_w)^2)
+mspe
+```
+Slightly higher out of sample performance compared to in-sample, as expected, since values of X are different for the out of sample test.
